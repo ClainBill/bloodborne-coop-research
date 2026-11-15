@@ -1,0 +1,5 @@
+.DS_Store
+# Raw captures and server logs stay local
+*.log
+Backups/
+ss-info-decoded.xml

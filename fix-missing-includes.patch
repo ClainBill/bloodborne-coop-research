@@ -1,0 +1,14 @@
+diff --git a/src/imgui/notifications_layer.cpp b/src/imgui/notifications_layer.cpp
+index e822610..2cc285a 100644
+--- a/src/imgui/notifications_layer.cpp
++++ b/src/imgui/notifications_layer.cpp
+@@ -1,6 +1,9 @@
+ // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <map>
++#include <mutex>
++#include <optional>
+ #include <cmrc/cmrc.hpp>
+ #include <imgui.h>
+ #include <queue>

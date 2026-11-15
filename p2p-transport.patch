@@ -1,0 +1,539 @@
+diff --git a/src/core/libraries/network/p2p_sockets.cpp b/src/core/libraries/network/p2p_sockets.cpp
+index 0eb3a462..26cbaac1 100644
+--- a/src/core/libraries/network/p2p_sockets.cpp
++++ b/src/core/libraries/network/p2p_sockets.cpp
+@@ -1,7 +1,17 @@
+ // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
+ // SPDX-License-Identifier: GPL-2.0-or-later
+ 
++#include <array>
++#include <atomic>
++#include <cstring>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <vector>
++
+ #include <common/assert.h>
++#include "common/logging/log.h"
++#include "core/emulator_settings.h"
+ #include "core/libraries/kernel/kernel.h"
+ #include "net.h"
+ #include "net_error.h"
+@@ -85,44 +95,467 @@ int P2PSocket::fstat(Libraries::Kernel::OrbisKernelStat* stat) {
+     return 0;
+ }
+ 
++// ============================================================================
++// P2P control-plane transport.
++//
++// One UDP socket carries three logical channels used by NpSignaling and
++// NpMatching2's own signaling layer (np_signaling_state.cpp /
++// np_matching2_signaling.cpp): Signaling, Control, Matching2. Those layers
++// already build fully-formed, self-identifying packets (4-byte "SHAD" magic
++// + a 1-byte type: 0x05/0x06/0x07 = signaling, 0x10 = control, 0x21 =
++// matching2) and hand them to us with a destination addr/port already
++// resolved (via RequestSignalingInfos or a prior handshake). Our only job
++// here is to move those bytes and, on receive, route each datagram back to
++// the right channel's queue.
++//
++// The one exception is talking to shadNet's own STUN/relay server: that
++// speaks a different, server-mandated wire format (see
++// shadNet/documentation/signaling.md) -- a 4-byte "vport" header
++// (src_vport=dst_vport=0xFFFF) wrapped around a 21-byte ping / 6-byte reply,
++// with no SHAD magic. We only wrap outgoing datagrams that way when the
++// destination is the known relay address, and only unwrap incoming
++// datagrams that way when the source is the known relay address. Everything
++// else on the wire is raw peer-to-peer traffic between two shadPS4
++// instances, demuxed purely by the SHAD magic + type byte already present
++// in the payload.
++//
++// addr/port convention: dest_addr/dest_port (Send*) and from_addr/from_port
++// (Recv*) are raw network-byte-order values, exactly as they come out of
++// sockaddr_in -- callers already treat them that way (see peer.addr/
++// peer.port usage in np_matching2_signaling.cpp). GetP2PConfiguredPort()
++// is the one exception: callers apply sceNetHtons() to it themselves before
++// embedding it in a packet, so it returns a host-order port number.
++// ============================================================================
++
++namespace {
++
++#ifdef _WIN32
++using RawSocket = SOCKET;
++constexpr RawSocket kInvalidSocket = INVALID_SOCKET;
++#else
++using RawSocket = int;
++constexpr RawSocket kInvalidSocket = -1;
++#endif
++
++constexpr u16 kVportSignaling = 0xFFFF; // symmetric byte pattern; no htons needed.
++constexpr size_t kVportHeaderSize = 4;
++constexpr size_t kStunPingSize = 21;
++constexpr size_t kStunEchoSize = 6;
++constexpr size_t kMaxDatagram = 4096;
++
++void CloseRawSocket(RawSocket sock) {
++#ifdef _WIN32
++    closesocket(sock);
++#else
++    ::close(sock);
++#endif
++}
++
++// "ip:port" -> (network-order IPv4, host-order port). Same "host:port" split
++// convention as NpHandler::ParseServerAddress. Empty/unparseable input (the
++// default) yields addr=0, meaning "no manual override configured".
++bool ParseSignalingInfo(const std::string& value, u32* out_addr, u16* out_port) {
++    if (value.empty()) {
++        return false;
++    }
++    const auto colon = value.rfind(':');
++    if (colon == std::string::npos) {
++        LOG_WARNING(Lib_Net, "P2P transport: signaling_info '{}' missing ':port'", value);
++        return false;
++    }
++    const std::string host = value.substr(0, colon);
++    u16 port = 0;
++    try {
++        port = static_cast<u16>(std::stoi(value.substr(colon + 1)));
++    } catch (const std::exception&) {
++        LOG_WARNING(Lib_Net, "P2P transport: signaling_info '{}' has an invalid port", value);
++        return false;
++    }
++    in_addr addr{};
++    if (::inet_pton(AF_INET, host.c_str(), &addr) != 1) {
++        LOG_WARNING(Lib_Net, "P2P transport: signaling_info '{}' has an invalid address", value);
++        return false;
++    }
++    *out_addr = addr.s_addr;
++    *out_port = port;
++    return true;
++}
++
++struct RawDatagram {
++    std::vector<u8> data;
++    u32 from_addr = 0;
++    u16 from_port = 0;
++};
++
++// Small bounded MPSC-ish queue: one receiver thread pushes, library/game
++// threads pop via P2P*RecvFrom's non-blocking poll semantics.
++class ChannelQueue {
++public:
++    void Push(RawDatagram&& dg) {
++        std::scoped_lock lock(mutex_);
++        if (queue_.size() >= kMaxQueued) {
++            queue_.pop_front();
++        }
++        queue_.push_back(std::move(dg));
++    }
++
++    bool Pop(RawDatagram& out) {
++        std::scoped_lock lock(mutex_);
++        if (queue_.empty()) {
++            return false;
++        }
++        out = std::move(queue_.front());
++        queue_.pop_front();
++        return true;
++    }
++
++private:
++    static constexpr size_t kMaxQueued = 64;
++    std::mutex mutex_;
++    std::deque<RawDatagram> queue_;
++};
++
++int DeliverFromQueue(ChannelQueue& queue, void* buf, u32 len, u32* from_addr, u16* from_port) {
++    RawDatagram dg;
++    if (!queue.Pop(dg)) {
++        return -1;
++    }
++    const u32 copy_len = std::min<u32>(len, static_cast<u32>(dg.data.size()));
++    if (copy_len > 0) {
++        std::memcpy(buf, dg.data.data(), copy_len);
++    }
++    if (from_addr) {
++        *from_addr = dg.from_addr;
++    }
++    if (from_port) {
++        *from_port = dg.from_port;
++    }
++    return static_cast<int>(copy_len);
++}
++
++class P2PTransport {
++public:
++    static P2PTransport& Instance() {
++        static P2PTransport instance;
++        return instance;
++    }
++
++    void SetRelayServer(u32 addr, u16 port) {
++        relay_addr_.store(addr, std::memory_order_relaxed);
++        relay_port_.store(port, std::memory_order_relaxed);
++    }
++
++    bool Ensure() {
++        if (running_.load(std::memory_order_acquire)) {
++            return true;
++        }
++        std::scoped_lock lock(init_mutex_);
++        if (running_.load(std::memory_order_acquire)) {
++            return true;
++        }
++        return OpenSocket();
++    }
++
++    bool IsReady() const {
++        return running_.load(std::memory_order_relaxed) &&
++               advertised_addr_.load(std::memory_order_relaxed) != 0 &&
++               advertised_port_host_.load(std::memory_order_relaxed) != 0;
++    }
++
++    u16 ConfiguredPort() const {
++        return advertised_port_host_.load(std::memory_order_relaxed);
++    }
++
++    u32 AdvertisedAddr() const {
++        return advertised_addr_.load(std::memory_order_relaxed);
++    }
++
++    int SendSignaling(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
++        if (!Ensure()) {
++            return -1;
++        }
++        return SendRaw(data, len, dest_addr, dest_port, IsRelay(dest_addr, dest_port));
++    }
++
++    int RecvSignaling(void* buf, u32 len, u32* from_addr, u16* from_port) {
++        return DeliverFromQueue(signaling_queue_, buf, len, from_addr, from_port);
++    }
++
++    int SendControl(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
++        if (!Ensure()) {
++            return -1;
++        }
++        return SendRaw(data, len, dest_addr, dest_port, false);
++    }
++
++    int RecvControl(void* buf, u32 len, u32* from_addr, u16* from_port) {
++        return DeliverFromQueue(control_queue_, buf, len, from_addr, from_port);
++    }
++
++    int SendMatching2(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
++        if (!Ensure()) {
++            return -1;
++        }
++        return SendRaw(data, len, dest_addr, dest_port, false);
++    }
++
++    int RecvMatching2(void* buf, u32 len, u32* from_addr, u16* from_port) {
++        return DeliverFromQueue(matching2_queue_, buf, len, from_addr, from_port);
++    }
++
++private:
++    P2PTransport() = default;
++    ~P2PTransport() {
++        stop_.store(true, std::memory_order_relaxed);
++        if (sock_ != kInvalidSocket) {
++            CloseRawSocket(sock_);
++        }
++        if (receiver_thread_.joinable()) {
++            receiver_thread_.join();
++        }
++    }
++    P2PTransport(const P2PTransport&) = delete;
++    P2PTransport& operator=(const P2PTransport&) = delete;
++
++    bool IsRelay(u32 addr, u16 port) const {
++        const u32 relay_addr = relay_addr_.load(std::memory_order_relaxed);
++        const u16 relay_port = relay_port_.load(std::memory_order_relaxed);
++        return relay_addr != 0 && addr == relay_addr && port == relay_port;
++    }
++
++    bool OpenSocket() {
++        u32 manual_addr = 0;
++        u16 manual_port = 0;
++        const bool has_manual =
++            ParseSignalingInfo(EmulatorSettings.GetSignalingInfo(), &manual_addr, &manual_port);
++
++        RawSocket sock = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
++        if (sock == kInvalidSocket) {
++            LOG_ERROR(Lib_Net, "P2P transport: failed to create UDP socket");
++            return false;
++        }
++
++        sockaddr_in bind_addr{};
++        bind_addr.sin_family = AF_INET;
++        bind_addr.sin_addr.s_addr = INADDR_ANY;
++        // signaling_info pins the local port so it matches what we advertise;
++        // otherwise let the OS assign one and rely on STUN to learn it.
++        bind_addr.sin_port = has_manual ? Libraries::Net::sceNetHtons(manual_port) : 0;
++        if (::bind(sock, reinterpret_cast<sockaddr*>(&bind_addr), sizeof(bind_addr)) != 0) {
++            LOG_ERROR(Lib_Net, "P2P transport: bind failed{}",
++                      has_manual ? " (signaling_info port may already be in use)" : "");
++            CloseRawSocket(sock);
++            return false;
++        }
++
++        // Short receive timeout so the receiver thread can observe stop_
++        // without needing a separate shutdown signal.
++#ifdef _WIN32
++        DWORD timeout_ms = 1000;
++        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms),
++                    sizeof(timeout_ms));
++#else
++        timeval timeout{.tv_sec = 1, .tv_usec = 0};
++        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
++#endif
++
++        sock_ = sock;
++        stop_.store(false, std::memory_order_relaxed);
++        receiver_thread_ = std::thread([this] { ReceiverLoop(); });
++        running_.store(true, std::memory_order_release);
++
++        if (has_manual) {
++            // Authoritative: skip STUN discovery, advertise this immediately.
++            manual_override_.store(true, std::memory_order_relaxed);
++            advertised_addr_.store(manual_addr, std::memory_order_relaxed);
++            advertised_port_host_.store(manual_port, std::memory_order_relaxed);
++            LOG_INFO(Lib_Net, "P2P transport: using configured signaling_info, advertising {:#x}:{}",
++                     manual_addr, manual_port);
++        }
++
++        sockaddr_in local{};
++        socklen_t local_len = sizeof(local);
++        if (::getsockname(sock_, reinterpret_cast<sockaddr*>(&local), &local_len) == 0) {
++            LOG_INFO(Lib_Net, "P2P transport: bound local UDP port {}",
++                     Libraries::Net::sceNetNtohs(local.sin_port));
++        }
++        return true;
++    }
++
++    int SendRaw(const void* data, u32 len, u32 dest_addr, u16 dest_port, bool wrap_vport) {
++        if (sock_ == kInvalidSocket || data == nullptr) {
++            return -1;
++        }
++        sockaddr_in dest{};
++        dest.sin_family = AF_INET;
++        dest.sin_addr.s_addr = dest_addr;
++        dest.sin_port = dest_port;
++
++        std::scoped_lock lock(send_mutex_);
++        if (!wrap_vport) {
++            return ::sendto(sock_, reinterpret_cast<const char*>(data), len, 0,
++                            reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
++        }
++
++        if (len + kVportHeaderSize > kMaxDatagram) {
++            return -1;
++        }
++        std::array<u8, kMaxDatagram> framed;
++        std::memcpy(framed.data(), &kVportSignaling, 2);
++        std::memcpy(framed.data() + 2, &kVportSignaling, 2);
++        std::memcpy(framed.data() + kVportHeaderSize, data, len);
++        const int rc = ::sendto(sock_, reinterpret_cast<const char*>(framed.data()),
++                                static_cast<int>(len + kVportHeaderSize), 0,
++                                reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
++        return rc < 0 ? rc : static_cast<int>(len);
++    }
++
++    void HandleRelayDatagram(const u8* data, int size) {
++        // shadNet only ever replies to a STUN ping with a vport-wrapped
++        // StunEcho -- 4-byte header + 6-byte ip/port.
++        if (size != static_cast<int>(kVportHeaderSize + kStunEchoSize)) {
++            return;
++        }
++        u16 src_vp, dst_vp;
++        std::memcpy(&src_vp, data, 2);
++        std::memcpy(&dst_vp, data + 2, 2);
++        if (src_vp != kVportSignaling || dst_vp != kVportSignaling) {
++            return;
++        }
++        u32 ext_ip;
++        u16 ext_port_net;
++        std::memcpy(&ext_ip, data + kVportHeaderSize, 4);
++        std::memcpy(&ext_port_net, data + kVportHeaderSize + 4, 2);
++
++        if (manual_override_.load(std::memory_order_relaxed)) {
++            // signaling_info is authoritative; just log what STUN observed in
++            // case it's useful for diagnosing a NAT/config mismatch.
++            LOG_DEBUG(Lib_Net,
++                      "P2P transport: STUN observed ext={:#x}:{} (ignored, signaling_info set)",
++                      ext_ip, Libraries::Net::sceNetNtohs(ext_port_net));
++            return;
++        }
++
++        advertised_addr_.store(ext_ip, std::memory_order_relaxed);
++        advertised_port_host_.store(Libraries::Net::sceNetNtohs(ext_port_net),
++                                    std::memory_order_relaxed);
++        LOG_DEBUG(Lib_Net, "P2P transport: STUN reply ext={:#x}:{}", ext_ip,
++                  Libraries::Net::sceNetNtohs(ext_port_net));
++    }
++
++    void HandlePeerDatagram(const u8* data, int size, u32 from_addr, u16 from_port) {
++        // Every peer-to-peer packet type already self-identifies with a
++        // 4-byte "SHAD" magic followed by a 1-byte type discriminator (see
++        // np_signaling_state.h's SignalingPacketType and
++        // np_matching2_signaling.cpp's Matching2HandshakePacket).
++        if (size < 5 || data[0] != 'S' || data[1] != 'H' || data[2] != 'A' || data[3] != 'D') {
++            return;
++        }
++        const u8 type = data[4];
++        RawDatagram dg{std::vector<u8>(data, data + size), from_addr, from_port};
++        switch (type) {
++        case 0x05: // EchoPing
++        case 0x06: // EchoPong
++        case 0x07: // Handshake (plain NpSignaling)
++            signaling_queue_.Push(std::move(dg));
++            break;
++        case 0x10: // Control
++            control_queue_.Push(std::move(dg));
++            break;
++        case 0x21: // Matching2 handshake
++            matching2_queue_.Push(std::move(dg));
++            break;
++        default:
++            LOG_DEBUG(Lib_Net, "P2P transport: unknown peer packet type={:#x}", type);
++            break;
++        }
++    }
++
++    void ReceiverLoop() {
++        std::array<u8, kMaxDatagram> buf;
++        while (!stop_.load(std::memory_order_relaxed)) {
++            sockaddr_in from{};
++            socklen_t from_len = sizeof(from);
++            const int rc = ::recvfrom(sock_, reinterpret_cast<char*>(buf.data()),
++                                      static_cast<int>(buf.size()), 0,
++                                      reinterpret_cast<sockaddr*>(&from), &from_len);
++            if (rc <= 0) {
++                continue; // timeout (SO_RCVTIMEO) or transient error; re-check stop_.
++            }
++
++            const u32 addr = from.sin_addr.s_addr;
++            const u16 port = from.sin_port;
++            if (IsRelay(addr, port)) {
++                HandleRelayDatagram(buf.data(), rc);
++            } else {
++                HandlePeerDatagram(buf.data(), rc, addr, port);
++            }
++        }
++    }
++
++    std::atomic<bool> running_{false};
++    std::atomic<bool> stop_{false};
++    std::mutex init_mutex_;
++    std::mutex send_mutex_;
++    RawSocket sock_ = kInvalidSocket;
++    std::thread receiver_thread_;
++
++    std::atomic<u32> relay_addr_{0};
++    std::atomic<u16> relay_port_{0};
++
++    std::atomic<u32> advertised_addr_{0};
++    std::atomic<u16> advertised_port_host_{0};
++    std::atomic<bool> manual_override_{false};
++
++    ChannelQueue signaling_queue_;
++    ChannelQueue control_queue_;
++    ChannelQueue matching2_queue_;
++};
++
++} // namespace
++
++void SetP2PRelayServer(u32 addr, u16 port) {
++    P2PTransport::Instance().SetRelayServer(addr, port);
++}
++
+ u16 GetP2PConfiguredPort() {
+-    return 0;
++    return P2PTransport::Instance().ConfiguredPort();
+ }
+ 
+ u32 GetP2PAdvertisedAddr() {
+-    return 0;
++    return P2PTransport::Instance().AdvertisedAddr();
+ }
+ 
+ bool EnsureP2PTransport() {
+-    return false;
++    return P2PTransport::Instance().Ensure();
+ }
+ 
+ bool P2PTransportIsReady() {
+-    return false;
++    return P2PTransport::Instance().IsReady();
+ }
+ 
+ int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+-    return -1;
++    return P2PTransport::Instance().SendSignaling(data, len, dest_addr, dest_port);
+ }
+ 
+ int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+-    return -1;
++    return P2PTransport::Instance().RecvSignaling(buf, len, from_addr, from_port);
+ }
+ 
+ int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+-    return -1;
++    return P2PTransport::Instance().SendControl(data, len, dest_addr, dest_port);
+ }
+ 
+ int P2PControlRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+-    return -1;
++    return P2PTransport::Instance().RecvControl(buf, len, from_addr, from_port);
+ }
+ 
+ int P2PMatching2SendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+-    return -1;
++    return P2PTransport::Instance().SendMatching2(data, len, dest_addr, dest_port);
+ }
+ 
+ int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+-    return -1;
++    return P2PTransport::Instance().RecvMatching2(buf, len, from_addr, from_port);
+ }
+ 
+-} // namespace Libraries::Net
+\ No newline at end of file
++} // namespace Libraries::Net
+diff --git a/src/core/libraries/network/sockets.h b/src/core/libraries/network/sockets.h
+index 5c8b083d..cbbf507b 100644
+--- a/src/core/libraries/network/sockets.h
++++ b/src/core/libraries/network/sockets.h
+@@ -179,6 +179,7 @@ struct UnixSocket : public Socket {
+     }
+ };
+ 
++void SetP2PRelayServer(u32 addr, u16 port);
+ u16 GetP2PConfiguredPort();
+ u32 GetP2PAdvertisedAddr();
+ bool EnsureP2PTransport();
+diff --git a/src/core/libraries/np/np_matching2/np_matching2_mm.cpp b/src/core/libraries/np/np_matching2/np_matching2_mm.cpp
+index 94882fde..fbdd839e 100644
+--- a/src/core/libraries/np/np_matching2/np_matching2_mm.cpp
++++ b/src/core/libraries/np/np_matching2/np_matching2_mm.cpp
+@@ -679,10 +679,12 @@ void SetMmShadNetClient(std::shared_ptr<ShadNet::ShadNetClient> client,
+         NpSignaling::Stubs::SetPeerResolver(nullptr);
+         NpSignaling::Stubs::SetMatching2Enabled(false);
+         NpSignaling::Stubs::SetMmServerEndpoint(0, 0);
++        Net::SetP2PRelayServer(0, 0);
+         StopMatching2HandshakeThread();
+         return;
+     }
+ 
++    Net::SetP2PRelayServer(server_addr, server_udp_port);
+     NpSignaling::Stubs::SetTransportHooks({
+         .signaling_send = Net::P2PSignalingSendTo,
+         .signaling_recv = Net::P2PSignalingRecvFrom,
+@@ -723,6 +725,7 @@ void ClearMmShadNetClient() {
+     NpSignaling::Stubs::SetPeerResolver(nullptr);
+     NpSignaling::Stubs::SetMatching2Enabled(false);
+     NpSignaling::Stubs::SetMmServerEndpoint(0, 0);
++    Net::SetP2PRelayServer(0, 0);
+     StopMatching2HandshakeThread();
+     {
+         std::lock_guard lock(g_mm.pending_mutex);

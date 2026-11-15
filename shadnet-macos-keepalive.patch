@@ -1,0 +1,19 @@
+diff --git a/src/server.cpp b/src/server.cpp
+index e88c871..5a174ff 100644
+--- a/src/server.cpp
++++ b/src/server.cpp
+@@ -323,7 +323,14 @@ static void SetAggressiveKeepalive(QTcpSocket* socket) {
+ #else
+     int fd = socket->socketDescriptor();
+     int idle = 60, interval = 5, count = 3;
++    // Same option, different spelling: macOS names the idle-before-first-probe
++    // setting TCP_KEEPALIVE, where Linux and the BSDs use TCP_KEEPIDLE.
++    // TCP_KEEPINTVL and TCP_KEEPCNT exist on both.
++#ifdef Q_OS_MACOS
++    setsockopt(fd, IPPROTO_TCP, TCP_KEEPALIVE, &idle, sizeof(idle));
++#else
+     setsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, &idle, sizeof(idle));
++#endif
+     setsockopt(fd, IPPROTO_TCP, TCP_KEEPINTVL, &interval, sizeof(interval));
+     setsockopt(fd, IPPROTO_TCP, TCP_KEEPCNT, &count, sizeof(count));
+ #endif

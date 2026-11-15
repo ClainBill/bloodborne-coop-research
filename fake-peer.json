@@ -1,0 +1,37 @@
+{
+  "AreaId": 402718720,
+  "AreaRegionId": 241010,
+  "ChannelId": 0,
+  "CharaId": 9223372036854775808,
+  "ClientVersion": 0,
+  "MatchingLevel": 10,
+  "MessageId": "SummonDataCreateRequest",
+  "NatType": 0,
+  "NaturalEnemy_BloodHunter": 0,
+  "NaturalEnemy_HunterOfHunter": 0,
+  "NaturalEnemy_Vileblood": 0,
+  "NaturalEnemy_VilebloodHunter": 0,
+  "PosX": -194,
+  "PosY": -28,
+  "PosZ": 66,
+  "Region": 1,
+  "RegionFlag": 1,
+  "SessionId": "8801cfc8-f027-4b2c-aa80-02e3291de7b9",
+  "SummonData": "QEIPAEBCDwBAQg8AQEIPAP////////////////////9wggMAWIYDAECKAwAojgMA//////8ZGRkBAAAAAAAAAENsYWluQmlsbAAAAAAAAADjFIGaAAAAQAAAARijk0LDGSvlwQjkhUKgnxI/cq0DAAoAAAAAAAcAHgAlAAJDbGFpbkJpbGwAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAL4AAP////8HAAAAAAAAAAAAAIA=",
+  "SummonDataVersion": 3,
+  "SummonMethod": 0,
+  "SummonType": 0,
+  "SummonWord": null,
+  "UnlockedFlagList": [
+    {
+      "UnlockedFlag": 0
+    },
+    {
+      "UnlockedFlag": 0
+    },
+    {
+      "UnlockedFlag": 0
+    }
+  ],
+  "UserId": 2108
+}

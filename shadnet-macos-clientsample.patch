@@ -1,0 +1,16 @@
+diff --git a/clientsample/CMakeLists.txt b/clientsample/CMakeLists.txt
+index c10afb9..74a5741 100644
+--- a/clientsample/CMakeLists.txt
++++ b/clientsample/CMakeLists.txt
+@@ -65,5 +65,10 @@ if(MSVC)
+     target_compile_options(shadnet-sample PRIVATE /W3 /utf-8)
+ else()
+     target_compile_options(shadnet-sample PRIVATE -Wall -Wextra)
+-    target_link_options(shadnet-sample PRIVATE -static-libgcc -static-libstdc++)
++    # -static-libgcc/-static-libstdc++ are GCC options. AppleClang rejects
++    # -static-libgcc outright, and macOS has no static libc++ to link against
++    # anyway -- the system library is the only supported one there.
++    if(NOT APPLE)
++        target_link_options(shadnet-sample PRIVATE -static-libgcc -static-libstdc++)
++    endif()
+ endif()

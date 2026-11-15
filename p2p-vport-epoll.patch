@@ -1,0 +1,965 @@
+diff --git a/src/core/libraries/network/net.cpp b/src/core/libraries/network/net.cpp
+index baf45b6..d2ffd00 100644
+--- a/src/core/libraries/network/net.cpp
++++ b/src/core/libraries/network/net.cpp
+@@ -657,8 +657,8 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
+         case Core::FileSys::FileType::Socket: {
+             auto native_handle = file->socket->Native();
+             if (!native_handle) {
+-                // P2P socket, cannot be added to epoll
+-                LOG_ERROR(Lib_Net, "P2P socket cannot be added to epoll (unimplemented)");
++                // P2P socket whose transport failed to open, or Native() otherwise unavailable.
++                LOG_ERROR(Lib_Net, "socket cannot be added to epoll (no native handle)");
+                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                 return ORBIS_NET_ERROR_EBADF;
+             }
+@@ -666,7 +666,22 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
+ #ifndef __FreeBSD__
+             epoll_event native_event = {.events = ConvertEpollEventsIn(event->events),
+                                         .data = {.fd = id}};
+-            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_ADD, *native_handle, &native_event) == 0);
++            if (epoll_ctl(epoll->epoll_fd, EPOLL_CTL_ADD, *native_handle, &native_event) != 0) {
++                // Every P2PSocket reports the same transport-wide readiness fd from
++                // Native(), so a second (or third...) P2P socket being added to the
++                // same epoll set hits EEXIST here -- that's expected, not an error.
++                // The real per-socket fan-out happens in sceNetEpollWait, which walks
++                // every id registered on this epoll rather than trusting native epoll
++                // to tell them apart. Fall back to MOD so the kernel-level
++                // registration for the shared fd stays alive either way.
++                ASSERT_MSG(errno == EEXIST, "epoll_ctl ADD failed: {}", strerror(errno));
++                LOG_DEBUG(Lib_Net,
++                          "epoll: native fd {} already registered on epollid={} ({}), id={} "
++                          "sharing it via MOD (expected for a second P2P socket)",
++                          *native_handle, epollid, epoll->name, id);
++                ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_MOD, *native_handle, &native_event) ==
++                       0);
++            }
+             epoll->events.emplace_back(id, *event);
+ #endif
+             break;
+@@ -707,8 +722,7 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
+         case Core::FileSys::FileType::Socket: {
+             auto native_handle = file->socket->Native();
+             if (!native_handle) {
+-                // P2P socket, cannot be modified in epoll
+-                LOG_ERROR(Lib_Net, "P2P socket cannot be modified in epoll (unimplemented)");
++                LOG_ERROR(Lib_Net, "socket cannot be modified in epoll (no native handle)");
+                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                 return ORBIS_NET_ERROR_EBADF;
+             }
+@@ -751,13 +765,36 @@ int PS4_SYSV_ABI sceNetEpollControl(OrbisNetId epollid, OrbisNetEpollFlag op, Or
+         case Core::FileSys::FileType::Socket: {
+             auto native_handle = file->socket->Native();
+             if (!native_handle) {
+-                // P2P socket, cannot be removed from epoll
+-                LOG_ERROR(Lib_Net, "P2P socket cannot be removed from epoll (unimplemented)");
++                LOG_ERROR(Lib_Net, "socket cannot be removed from epoll (no native handle)");
+                 *sceNetErrnoLoc() = ORBIS_NET_EBADF;
+                 return ORBIS_NET_ERROR_EBADF;
+             }
+ #ifndef __FreeBSD__
+-            ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *native_handle, nullptr) == 0);
++            // Other ids on this epoll may report the same native handle -- all
++            // P2P sockets share one transport-wide readiness fd (see
++            // P2PTransport::ReadinessFd). Only actually unregister it from the
++            // real epoll set once nothing else here still needs it, otherwise
++            // we'd break epoll for every other P2P socket on this epoll too.
++            bool still_needed = false;
++            for (const auto& [other_id, other_event] : epoll->events) {
++                if (other_id == id) {
++                    continue;
++                }
++                auto other_file = FDTable::Instance()->GetFile(other_id);
++                if (other_file && other_file->type.load() == Core::FileSys::FileType::Socket &&
++                    other_file->socket && other_file->socket->Native() == native_handle) {
++                    still_needed = true;
++                    break;
++                }
++            }
++            if (!still_needed) {
++                ASSERT(epoll_ctl(epoll->epoll_fd, EPOLL_CTL_DEL, *native_handle, nullptr) == 0);
++            } else {
++                LOG_DEBUG(Lib_Net,
++                          "epoll: id={} removed from epollid={} ({}), native fd {} kept "
++                          "registered (still shared with another P2P socket)",
++                          id, epollid, epoll->name, *native_handle);
++            }
+             epoll->events.erase(it);
+ #endif
+             break;
+@@ -863,13 +900,35 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
+     } else if (result == 0) {
+         LOG_TRACE(Lib_Net, "timed out");
+     } else {
+-        for (; i < result; ++i) {
+-            const auto& current_event = native_events[i];
+-            LOG_DEBUG(Lib_Net, "native_event[{}] = ( .events = {}, .data = {:#x} )", i,
++        // Sockets with HasSharedNativeFd() (currently just P2PSocket) can't be
++        // resolved from a native event alone: several distinct orbis ids can
++        // report the same underlying fd from Native(), so the kernel only ever
++        // attributes a wakeup to whichever one most recently ADD/MOD'd it, not
++        // necessarily the one(s) that actually have data right now. Skip those
++        // here and resolve them below by asking every such id on this epoll
++        // directly instead. Regular 1:1 sockets go through the fast path as
++        // before.
++        bool did_shared_resync = false;
++        for (int n = 0; n < result; ++n) {
++            const auto& current_event = native_events[n];
++            LOG_DEBUG(Lib_Net, "native_event[{}] = ( .events = {}, .data = {:#x} )", n,
+                       current_event.events, current_event.data.u64);
+             const auto it = std::ranges::find_if(
+                 epoll->events, [&](auto& el) { return el.first == current_event.data.fd; });
+             ASSERT(it != epoll->events.end());
++
++            const auto owner = FDTable::Instance()->GetFile(current_event.data.fd);
++            const bool shared_fd = owner &&
++                                   owner->type.load() == Core::FileSys::FileType::Socket &&
++                                   owner->socket && owner->socket->HasSharedNativeFd();
++            if (shared_fd) {
++                did_shared_resync = true;
++                continue;
++            }
++
++            if (i >= maxevents) {
++                break;
++            }
+             events[i] = {
+                 .events = ConvertEpollEventsOut(current_event.events),
+                 .ident = static_cast<u64>(current_event.data.fd),
+@@ -877,6 +936,42 @@ int PS4_SYSV_ABI sceNetEpollWait(OrbisNetId epollid, OrbisNetEpollEvent* events,
+             };
+             LOG_DEBUG(Lib_Net, "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} )", i,
+                       events[i].events, events[i].ident, events[i].data.data_u64);
++            ++i;
++        }
++
++        if (did_shared_resync) {
++            // The shared readiness fd fired for *something*; forget which id
++            // native epoll happened to attribute it to and just check every
++            // shared-fd socket on this epoll directly.
++            DrainP2PReadiness();
++            const int before = i;
++            for (const auto& [orbis_fd, ev] : epoll->events) {
++                if (i >= maxevents) {
++                    break;
++                }
++                auto f = FDTable::Instance()->GetFile(orbis_fd);
++                if (!f || f->type.load() != Core::FileSys::FileType::Socket || !f->socket) {
++                    continue;
++                }
++                if (!f->socket->HasSharedNativeFd() || !f->socket->HasQueuedData()) {
++                    continue;
++                }
++                events[i] = {
++                    .events = ConvertEpollEventsOut(EPOLLIN),
++                    .ident = static_cast<u64>(orbis_fd),
++                    .data = ev.data,
++                };
++                LOG_DEBUG(Lib_Net,
++                          "event[{}] = ( .events = {:#x}, .ident = {}, .data = {:#x} ) [p2p]", i,
++                          events[i].events, events[i].ident, events[i].data.data_u64);
++                ++i;
++            }
++            // If this fires with 0 every time, the readiness pipe is waking
++            // epoll but nothing registered on this epoll actually has data --
++            // a spurious/stale wake, or a bind/epoll-registration ordering
++            // race worth checking first when P2P traffic looks stalled.
++            LOG_DEBUG(Lib_Net, "epoll: P2P readiness fired on epollid={} ({}), {} socket(s) had data",
++                      epollid, epoll->name, i - before);
+         }
+     }
+ 
+diff --git a/src/core/libraries/network/p2p_sockets.cpp b/src/core/libraries/network/p2p_sockets.cpp
+index 26cbaac..75e8f6f 100644
+--- a/src/core/libraries/network/p2p_sockets.cpp
++++ b/src/core/libraries/network/p2p_sockets.cpp
+@@ -5,6 +5,7 @@
+ #include <atomic>
+ #include <cstring>
+ #include <deque>
++#include <map>
+ #include <mutex>
+ #include <thread>
+ #include <vector>
+@@ -17,12 +18,15 @@
+ #include "net_error.h"
+ #include "sockets.h"
+ 
++#ifndef _WIN32
++#include <fcntl.h>
++#endif
++
+ namespace Libraries::Net {
+ 
+-int P2PSocket::Close() {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    return 0;
+-}
++// Close, Bind, SendPacket, ReceivePacket, Native, HasQueuedData, Connect,
++// SendMessage, ReceiveMessage, GetSocketAddress and GetPeerName are
++// implemented further down, after the shared P2P transport they depend on.
+ 
+ int P2PSocket::SetSocketOptions(int level, int optname, const void* optval, u32 optlen) {
+     LOG_ERROR(Lib_Net, "(STUBBED) called");
+@@ -34,62 +38,17 @@ int P2PSocket::GetSocketOptions(int level, int optname, void* optval, u32* optle
+     return 0;
+ }
+ 
+-int P2PSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    return 0;
+-}
+-
+ int P2PSocket::Listen(int backlog) {
+     LOG_ERROR(Lib_Net, "(STUBBED) called");
+     return 0;
+ }
+ 
+-int P2PSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
+-    return -1;
+-}
+-
+-int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSockaddr* to,
+-                          u32 tolen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
+-    return -1;
+-}
+-
+-int P2PSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
+-    return -1;
+-}
+-
+-int P2PSocket::ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from, u32* fromlen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
+-    return -1;
+-}
+-
+ SocketPtr P2PSocket::Accept(OrbisNetSockaddr* addr, u32* addrlen) {
+     LOG_ERROR(Lib_Net, "(STUBBED) called");
+     *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
+     return nullptr;
+ }
+ 
+-int P2PSocket::Connect(const OrbisNetSockaddr* addr, u32 namelen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    return 0;
+-}
+-
+-int P2PSocket::GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    return 0;
+-}
+-
+-int P2PSocket::GetPeerName(OrbisNetSockaddr* addr, u32* namelen) {
+-    LOG_ERROR(Lib_Net, "(STUBBED) called");
+-    return 0;
+-}
+-
+ int P2PSocket::fstat(Libraries::Kernel::OrbisKernelStat* stat) {
+     LOG_ERROR(Lib_Net, "(STUBBED) called");
+     return 0;
+@@ -141,7 +100,10 @@ constexpr u16 kVportSignaling = 0xFFFF; // symmetric byte pattern; no htons need
+ constexpr size_t kVportHeaderSize = 4;
+ constexpr size_t kStunPingSize = 21;
+ constexpr size_t kStunEchoSize = 6;
+-constexpr size_t kMaxDatagram = 4096;
++// Max theoretical UDP payload over IPv4 (65535 - 8-byte UDP header - 20-byte
++// IP header). Previously this was capped at 4096, silently dropping any game
++// packet whose vport-framed size exceeded that -- see SendVport/SendRaw.
++constexpr size_t kMaxDatagram = 65507;
+ 
+ void CloseRawSocket(RawSocket sock) {
+ #ifdef _WIN32
+@@ -185,6 +147,7 @@ struct RawDatagram {
+     std::vector<u8> data;
+     u32 from_addr = 0;
+     u16 from_port = 0;
++    u16 from_vport = 0; // only meaningful for vport-framed (game P2PSocket) datagrams
+ };
+ 
+ // Small bounded MPSC-ish queue: one receiver thread pushes, library/game
+@@ -209,13 +172,19 @@ public:
+         return true;
+     }
+ 
++    bool HasData() {
++        std::scoped_lock lock(mutex_);
++        return !queue_.empty();
++    }
++
+ private:
+     static constexpr size_t kMaxQueued = 64;
+     std::mutex mutex_;
+     std::deque<RawDatagram> queue_;
+ };
+ 
+-int DeliverFromQueue(ChannelQueue& queue, void* buf, u32 len, u32* from_addr, u16* from_port) {
++int DeliverFromQueue(ChannelQueue& queue, void* buf, u32 len, u32* from_addr, u16* from_port,
++                      u16* from_vport = nullptr) {
+     RawDatagram dg;
+     if (!queue.Pop(dg)) {
+         return -1;
+@@ -230,6 +199,9 @@ int DeliverFromQueue(ChannelQueue& queue, void* buf, u32 len, u32* from_addr, u1
+     if (from_port) {
+         *from_port = dg.from_port;
+     }
++    if (from_vport) {
++        *from_vport = dg.from_vport;
++    }
+     return static_cast<int>(copy_len);
+ }
+ 
+@@ -303,6 +275,125 @@ public:
+         return DeliverFromQueue(matching2_queue_, buf, len, from_addr, from_port);
+     }
+ 
++    // ------------------------------------------------------------------
++    // Generic vport channels, used by game-opened P2PSocket instances
++    // (ORBIS_NET_SOCK_DGRAM_P2P). Unlike the three fixed channels above,
++    // these are dynamic: a queue is created when the game binds a vport
++    // and torn down when the socket closes. Wire format is a raw 4-byte
++    // [src_vport][dst_vport] header (both network byte order) with no
++    // SHAD magic -- that's how real PS4 titles multiplex P2P traffic, and
++    // is how we tell "internal NP channel" packets (SHAD-tagged) apart
++    // from "game P2P socket" packets (everything else) in
++    // HandlePeerDatagram below.
++    // ------------------------------------------------------------------
++
++    void RegisterVport(u16 vport) {
++        std::scoped_lock lock(vport_mutex_);
++        vport_queues_.try_emplace(vport);
++    }
++
++    void UnregisterVport(u16 vport) {
++        std::scoped_lock lock(vport_mutex_);
++        vport_queues_.erase(vport);
++    }
++
++    bool VportHasData(u16 vport) {
++        std::scoped_lock lock(vport_mutex_);
++        const auto it = vport_queues_.find(vport);
++        return it != vport_queues_.end() && it->second.HasData();
++    }
++
++    int SendVport(u16 src_vport, u16 dst_vport, const void* data, u32 len, u32 dest_addr,
++                  u16 dest_port) {
++        if (!Ensure()) {
++            LOG_ERROR(Lib_Net, "P2P transport: send on vport {} dropped, transport not open",
++                      Libraries::Net::sceNetNtohs(src_vport));
++            return -1;
++        }
++        if (len + kVportHeaderSize > kMaxDatagram) {
++            LOG_ERROR(Lib_Net, "P2P transport: send on vport {} of {} bytes exceeds max datagram",
++                      Libraries::Net::sceNetNtohs(src_vport), len);
++            return -1;
++        }
++        std::array<u8, kMaxDatagram> framed;
++        std::memcpy(framed.data(), &src_vport, 2);
++        std::memcpy(framed.data() + 2, &dst_vport, 2);
++        std::memcpy(framed.data() + kVportHeaderSize, data, len);
++
++        sockaddr_in dest{};
++        dest.sin_family = AF_INET;
++        dest.sin_addr.s_addr = dest_addr;
++        dest.sin_port = dest_port;
++
++        std::scoped_lock lock(send_mutex_);
++        const int rc = ::sendto(sock_, reinterpret_cast<const char*>(framed.data()),
++                                static_cast<int>(len + kVportHeaderSize), 0,
++                                reinterpret_cast<sockaddr*>(&dest), sizeof(dest));
++        if (rc < 0) {
++            LOG_ERROR(Lib_Net,
++                      "P2P transport: sendto failed for vport {}->{} to {:#x}:{}, errno={} ({})",
++                      Libraries::Net::sceNetNtohs(src_vport), Libraries::Net::sceNetNtohs(dst_vport),
++                      dest_addr, Libraries::Net::sceNetNtohs(dest_port), errno, strerror(errno));
++        } else {
++            LOG_DEBUG(Lib_Net, "P2P transport: sent {} bytes, vport {}->{} to {:#x}:{}", len,
++                      Libraries::Net::sceNetNtohs(src_vport), Libraries::Net::sceNetNtohs(dst_vport),
++                      dest_addr, Libraries::Net::sceNetNtohs(dest_port));
++        }
++        return rc < 0 ? rc : static_cast<int>(len);
++    }
++
++    int RecvVport(u16 vport, void* buf, u32 len, u32* from_addr, u16* from_port,
++                  u16* from_vport) {
++        std::scoped_lock lock(vport_mutex_);
++        const auto it = vport_queues_.find(vport);
++        if (it == vport_queues_.end()) {
++            return -1;
++        }
++        return DeliverFromQueue(it->second, buf, len, from_addr, from_port, from_vport);
++    }
++
++    // Not used for epoll registration -- see ReadinessFd(). Kept for
++    // send-side use (SendVport/SendRaw) and diagnostics.
++    net_socket NativeSocket() const {
++        return sock_;
++    }
++
++    // Read end of a self-pipe that gets a byte written to it (see
++    // SignalReadiness) any time a datagram is queued for any channel or
++    // vport. This -- not the raw UDP socket -- is what P2PSocket::Native()
++    // hands to sceNetEpollControl. The raw socket can't be used directly:
++    // ReceiverLoop below is a dedicated thread that continuously calls
++    // recvfrom() on it, so by the time a guest's epoll_wait() gets scheduled
++    // the kernel-level receive buffer is usually already empty again (that
++    // thread beat it to the data) and epoll would never see it as readable.
++    // The pipe decouples "epoll-visible readiness" from "raw socket has
++    // unread bytes" the same way an eventfd would.
++    std::optional<net_socket> ReadinessFd() const {
++#ifndef _WIN32
++        if (readiness_read_fd_ < 0) {
++            return {};
++        }
++        return readiness_read_fd_;
++#else
++        return {};
++#endif
++    }
++
++    // Discards any pending wake bytes. Safe to call any time -- the pipe
++    // only ever indicates "something changed since last drained", never an
++    // exact count, so callers should re-derive real per-socket state (via
++    // HasQueuedData()) rather than relying on how many bytes were read here.
++    void DrainReadiness() {
++#ifndef _WIN32
++        if (readiness_read_fd_ < 0) {
++            return;
++        }
++        char buf[64];
++        while (::read(readiness_read_fd_, buf, sizeof(buf)) > 0) {
++        }
++#endif
++    }
++
+ private:
+     P2PTransport() = default;
+     ~P2PTransport() {
+@@ -313,6 +404,14 @@ private:
+         if (receiver_thread_.joinable()) {
+             receiver_thread_.join();
+         }
++#ifndef _WIN32
++        if (readiness_read_fd_ >= 0) {
++            ::close(readiness_read_fd_);
++        }
++        if (readiness_write_fd_ >= 0) {
++            ::close(readiness_write_fd_);
++        }
++#endif
+     }
+     P2PTransport(const P2PTransport&) = delete;
+     P2PTransport& operator=(const P2PTransport&) = delete;
+@@ -359,6 +458,19 @@ private:
+         ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+ #endif
+ 
++#ifndef _WIN32
++        int pipe_fds[2] = {-1, -1};
++        if (::pipe(pipe_fds) == 0) {
++            ::fcntl(pipe_fds[0], F_SETFL, O_NONBLOCK);
++            ::fcntl(pipe_fds[1], F_SETFL, O_NONBLOCK);
++            readiness_read_fd_ = pipe_fds[0];
++            readiness_write_fd_ = pipe_fds[1];
++        } else {
++            LOG_ERROR(Lib_Net, "P2P transport: failed to create readiness pipe, "
++                                "P2P sockets won't be able to join epoll");
++        }
++#endif
++
+         sock_ = sock;
+         stop_.store(false, std::memory_order_relaxed);
+         receiver_thread_ = std::thread([this] { ReceiverLoop(); });
+@@ -443,32 +555,84 @@ private:
+                   Libraries::Net::sceNetNtohs(ext_port_net));
+     }
+ 
++    // Best-effort wake for anyone blocked in sceNetEpollWait via ReadinessFd().
++    // Called every time a datagram lands in any queue below.
++    void SignalReadiness() {
++#ifndef _WIN32
++        if (readiness_write_fd_ >= 0) {
++            const char byte = 1;
++            ::write(readiness_write_fd_, &byte, 1); // EAGAIN just means a wake is already pending
++        }
++#endif
++    }
++
+     void HandlePeerDatagram(const u8* data, int size, u32 from_addr, u16 from_port) {
+         // Every peer-to-peer packet type already self-identifies with a
+         // 4-byte "SHAD" magic followed by a 1-byte type discriminator (see
+         // np_signaling_state.h's SignalingPacketType and
+         // np_matching2_signaling.cpp's Matching2HandshakePacket).
+-        if (size < 5 || data[0] != 'S' || data[1] != 'H' || data[2] != 'A' || data[3] != 'D') {
++        if (size >= 5 && data[0] == 'S' && data[1] == 'H' && data[2] == 'A' && data[3] == 'D') {
++            const u8 type = data[4];
++            RawDatagram dg{std::vector<u8>(data, data + size), from_addr, from_port};
++            switch (type) {
++            case 0x05: // EchoPing
++            case 0x06: // EchoPong
++            case 0x07: // Handshake (plain NpSignaling)
++                signaling_queue_.Push(std::move(dg));
++                SignalReadiness();
++                break;
++            case 0x10: // Control
++                control_queue_.Push(std::move(dg));
++                SignalReadiness();
++                break;
++            case 0x21: // Matching2 handshake
++                matching2_queue_.Push(std::move(dg));
++                SignalReadiness();
++                break;
++            default:
++                LOG_DEBUG(Lib_Net, "P2P transport: unknown peer packet type={:#x}", type);
++                break;
++            }
++            return;
++        }
++
++        // Not one of our internal SHAD-tagged channels -- treat it as a
++        // vport-framed datagram for a game-opened P2PSocket
++        // (ORBIS_NET_SOCK_DGRAM_P2P). This is how a real PS4 multiplexes P2P
++        // traffic on the wire: no magic, just [src_vport][dst_vport] in
++        // network byte order followed by the payload. Bloodborne uses vport
++        // 40 for its command channel (opened right after the signaling
++        // context is created) and vport 30 for its data channel (opened
++        // once a room exists).
++        if (size < static_cast<int>(kVportHeaderSize)) {
++            LOG_DEBUG(Lib_Net, "P2P transport: runt datagram ({} bytes), dropping", size);
+             return;
+         }
+-        const u8 type = data[4];
+-        RawDatagram dg{std::vector<u8>(data, data + size), from_addr, from_port};
+-        switch (type) {
+-        case 0x05: // EchoPing
+-        case 0x06: // EchoPong
+-        case 0x07: // Handshake (plain NpSignaling)
+-            signaling_queue_.Push(std::move(dg));
+-            break;
+-        case 0x10: // Control
+-            control_queue_.Push(std::move(dg));
+-            break;
+-        case 0x21: // Matching2 handshake
+-            matching2_queue_.Push(std::move(dg));
+-            break;
+-        default:
+-            LOG_DEBUG(Lib_Net, "P2P transport: unknown peer packet type={:#x}", type);
+-            break;
++        u16 src_vport, dst_vport;
++        std::memcpy(&src_vport, data, 2);
++        std::memcpy(&dst_vport, data + 2, 2);
++
++        std::scoped_lock lock(vport_mutex_);
++        const auto it = vport_queues_.find(dst_vport);
++        if (it == vport_queues_.end()) {
++            // Worth a WARNING, not DEBUG: this means a peer sent us traffic
++            // for a vport the game hasn't bound yet (or already closed) --
++            // e.g. the classic "guest never responds" symptom, where the
++            // host's packet did arrive but nothing on this end was listening
++            // for it yet.
++            LOG_WARNING(Lib_Net, "P2P transport: {} bytes from {:#x}:{} for unbound vport {}, dropping",
++                        size - static_cast<int>(kVportHeaderSize), from_addr,
++                        Libraries::Net::sceNetNtohs(from_port), Libraries::Net::sceNetNtohs(dst_vport));
++            return;
+         }
++        RawDatagram dg{std::vector<u8>(data + kVportHeaderSize, data + size), from_addr,
++                       from_port, src_vport};
++        it->second.Push(std::move(dg));
++        SignalReadiness();
++        LOG_DEBUG(Lib_Net, "P2P transport: queued {} bytes, vport {}->{} from {:#x}:{}",
++                  size - static_cast<int>(kVportHeaderSize), Libraries::Net::sceNetNtohs(src_vport),
++                  Libraries::Net::sceNetNtohs(dst_vport), from_addr,
++                  Libraries::Net::sceNetNtohs(from_port));
+     }
+ 
+     void ReceiverLoop() {
+@@ -499,6 +663,10 @@ private:
+     std::mutex send_mutex_;
+     RawSocket sock_ = kInvalidSocket;
+     std::thread receiver_thread_;
++#ifndef _WIN32
++    int readiness_read_fd_ = -1;
++    int readiness_write_fd_ = -1;
++#endif
+ 
+     std::atomic<u32> relay_addr_{0};
+     std::atomic<u16> relay_port_{0};
+@@ -510,6 +678,9 @@ private:
+     ChannelQueue signaling_queue_;
+     ChannelQueue control_queue_;
+     ChannelQueue matching2_queue_;
++
++    std::mutex vport_mutex_;
++    std::map<u16, ChannelQueue> vport_queues_;
+ };
+ 
+ } // namespace
+@@ -534,6 +705,10 @@ bool P2PTransportIsReady() {
+     return P2PTransport::Instance().IsReady();
+ }
+ 
++void DrainP2PReadiness() {
++    P2PTransport::Instance().DrainReadiness();
++}
++
+ int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port) {
+     return P2PTransport::Instance().SendSignaling(data, len, dest_addr, dest_port);
+ }
+@@ -558,4 +733,285 @@ int P2PMatching2RecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port) {
+     return P2PTransport::Instance().RecvMatching2(buf, len, from_addr, from_port);
+ }
+ 
++// ============================================================================
++// Game-facing P2PSocket (ORBIS_NET_SOCK_DGRAM_P2P), backed by the same shared
++// transport as the internal NP channels above. A socket "exists" as soon as
++// it's constructed (sys_socketex checks IsValid() immediately), but it only
++// becomes reachable once the game calls Bind() with a vport -- that's when we
++// register a receive queue and start actually being able to route it packets.
++// ============================================================================
++
++std::optional<net_socket> P2PSocket::Native() {
++    // Every P2P socket reports the transport's single readiness pipe fd
++    // here, not the raw UDP socket (see P2PTransport::ReadinessFd for why).
++    // sceNetEpollControl will end up registering that same fd multiple times
++    // (once per socket) against the real epoll set; sceNetEpollWait is what
++    // makes that actually resolve to the right per-socket events -- see the
++    // P2P handling added to it in net.cpp.
++    if (!P2PTransport::Instance().Ensure()) {
++        return {};
++    }
++    return P2PTransport::Instance().ReadinessFd();
++}
++
++bool P2PSocket::HasQueuedData() {
++    std::scoped_lock lock(m_mutex);
++    if (!bound_) {
++        return false;
++    }
++    return P2PTransport::Instance().VportHasData(bound_vport_);
++}
++
++int P2PSocket::Close() {
++    std::scoped_lock lock(m_mutex);
++    if (bound_) {
++        P2PTransport::Instance().UnregisterVport(bound_vport_);
++        bound_ = false;
++    }
++    return 0;
++}
++
++int P2PSocket::Bind(const OrbisNetSockaddr* addr, u32 addrlen) {
++    std::scoped_lock lock(m_mutex);
++    if (addr == nullptr || addrlen < sizeof(OrbisNetSockaddrIn)) {
++        LOG_ERROR(Lib_Net, "P2P bind: invalid addr/addrlen ({})", addrlen);
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++    if (!P2PTransport::Instance().Ensure()) {
++        LOG_ERROR(Lib_Net, "P2P bind: shared transport failed to open");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EADDRNOTAVAIL;
++        return -1;
++    }
++
++    const auto* orbis_addr = reinterpret_cast<const OrbisNetSockaddrIn*>(addr);
++    if (bound_) {
++        P2PTransport::Instance().UnregisterVport(bound_vport_);
++    }
++    bound_vport_ = orbis_addr->sin_vport;
++    bound_ = true;
++    P2PTransport::Instance().RegisterVport(bound_vport_);
++
++    LOG_INFO(Lib_Net, "P2P bind: vport={} (game requested port={})",
++             sceNetNtohs(bound_vport_), sceNetNtohs(orbis_addr->sin_port));
++    return 0;
++}
++
++int P2PSocket::SendPacket(const void* msg, u32 len, int flags, const OrbisNetSockaddr* to,
++                          u32 tolen) {
++    std::scoped_lock lock(m_mutex);
++    if (!bound_) {
++        LOG_ERROR(Lib_Net, "P2P sendto: socket not bound to a vport yet");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EDESTADDRREQ;
++        return -1;
++    }
++    if (to == nullptr || tolen < sizeof(OrbisNetSockaddrIn)) {
++        LOG_ERROR(Lib_Net, "P2P sendto: missing/short destination address (tolen={})", tolen);
++        *Libraries::Kernel::__Error() = ORBIS_NET_EDESTADDRREQ;
++        return -1;
++    }
++
++    const auto* orbis_to = reinterpret_cast<const OrbisNetSockaddrIn*>(to);
++    const int rc = P2PTransport::Instance().SendVport(bound_vport_, orbis_to->sin_vport, msg, len,
++                                                       orbis_to->sin_addr, orbis_to->sin_port);
++    if (rc < 0) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
++        return -1;
++    }
++    return rc;
++}
++
++int P2PSocket::ReceivePacket(void* buf, u32 len, int flags, OrbisNetSockaddr* from, u32* fromlen) {
++    std::scoped_lock lock(receive_mutex);
++    if (!bound_) {
++        LOG_ERROR(Lib_Net, "P2P recvfrom: socket not bound to a vport yet");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EBADF;
++        return -1;
++    }
++
++    // The transport's own receiver thread continuously drains the shared
++    // socket into per-vport queues (see P2PTransport::ReceiverLoop), so we
++    // just need to pop from ours.
++    u32 from_addr = 0;
++    u16 from_port = 0;
++    u16 from_vport = 0;
++    const int rc = P2PTransport::Instance().RecvVport(bound_vport_, buf, len, &from_addr,
++                                                       &from_port, &from_vport);
++    if (rc < 0) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EWOULDBLOCK;
++        return -1;
++    }
++
++    if (from != nullptr) {
++        auto* orbis_from = reinterpret_cast<OrbisNetSockaddrIn*>(from);
++        std::memset(orbis_from, 0, sizeof(OrbisNetSockaddrIn));
++        orbis_from->sin_len = sizeof(OrbisNetSockaddrIn);
++        orbis_from->sin_family = ORBIS_NET_AF_INET;
++        orbis_from->sin_addr = from_addr;
++        orbis_from->sin_port = from_port;
++        orbis_from->sin_vport = from_vport;
++        if (fromlen) {
++            *fromlen = sizeof(OrbisNetSockaddrIn);
++        }
++    }
++    LOG_DEBUG(Lib_Net, "P2P recvfrom: {} bytes on vport {} from {:#x}:{} (peer vport={})", rc,
++              sceNetNtohs(bound_vport_), from_addr, sceNetNtohs(from_port), sceNetNtohs(from_vport));
++    return rc;
++}
++
++int P2PSocket::Connect(const OrbisNetSockaddr* addr, u32 namelen) {
++    std::scoped_lock lock(m_mutex);
++    if (addr == nullptr || namelen < sizeof(OrbisNetSockaddrIn)) {
++        LOG_ERROR(Lib_Net, "P2P connect: invalid addr/addrlen ({})", namelen);
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++    const auto* orbis_addr = reinterpret_cast<const OrbisNetSockaddrIn*>(addr);
++    connected_addr_ = orbis_addr->sin_addr;
++    connected_port_ = orbis_addr->sin_port;
++    connected_vport_ = orbis_addr->sin_vport;
++    connected_ = true;
++    LOG_INFO(Lib_Net, "P2P connect: peer vport={} addr={:#x}:{}", sceNetNtohs(orbis_addr->sin_vport),
++             orbis_addr->sin_addr, sceNetNtohs(orbis_addr->sin_port));
++    return 0;
++}
++
++int P2PSocket::SendMessage(const OrbisNetMsghdr* msg, int flags) {
++    std::scoped_lock lock(m_mutex);
++    if (!bound_) {
++        LOG_ERROR(Lib_Net, "P2P sendmsg: socket not bound to a vport yet");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EDESTADDRREQ;
++        return -1;
++    }
++    if (msg == nullptr) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++
++    u32 dest_addr = 0;
++    u16 dest_port = 0;
++    u16 dest_vport = 0;
++    if (msg->msg_name != nullptr && msg->msg_namelen >= sizeof(OrbisNetSockaddrIn)) {
++        const auto* to = reinterpret_cast<const OrbisNetSockaddrIn*>(msg->msg_name);
++        dest_addr = to->sin_addr;
++        dest_port = to->sin_port;
++        dest_vport = to->sin_vport;
++    } else if (connected_) {
++        dest_addr = connected_addr_;
++        dest_port = connected_port_;
++        dest_vport = connected_vport_;
++    } else {
++        LOG_ERROR(Lib_Net, "P2P sendmsg: no destination (msg_name null and socket not connected)");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EDESTADDRREQ;
++        return -1;
++    }
++
++    std::array<u8, kMaxDatagram> gathered;
++    u32 total = 0;
++    for (int i = 0; i < msg->msg_iovlen; ++i) {
++        const auto& iov = msg->msg_iov[i];
++        if (total + iov.iov_len > gathered.size()) {
++            LOG_ERROR(Lib_Net, "P2P sendmsg: message too large ({}+ bytes)", total + iov.iov_len);
++            *Libraries::Kernel::__Error() = ORBIS_NET_EMSGSIZE;
++            return -1;
++        }
++        std::memcpy(gathered.data() + total, iov.iov_base, iov.iov_len);
++        total += static_cast<u32>(iov.iov_len);
++    }
++
++    const int rc = P2PTransport::Instance().SendVport(bound_vport_, dest_vport, gathered.data(),
++                                                       total, dest_addr, dest_port);
++    if (rc < 0) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EAGAIN;
++        return -1;
++    }
++    return rc;
++}
++
++int P2PSocket::ReceiveMessage(OrbisNetMsghdr* msg, int flags) {
++    std::scoped_lock lock(receive_mutex);
++    if (!bound_) {
++        LOG_ERROR(Lib_Net, "P2P recvmsg: socket not bound to a vport yet");
++        *Libraries::Kernel::__Error() = ORBIS_NET_EBADF;
++        return -1;
++    }
++    if (msg == nullptr || msg->msg_iov == nullptr || msg->msg_iovlen <= 0) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++
++    std::array<u8, kMaxDatagram> received;
++    u32 from_addr = 0;
++    u16 from_port = 0;
++    u16 from_vport = 0;
++    const int rc = P2PTransport::Instance().RecvVport(
++        bound_vport_, received.data(), static_cast<u32>(received.size()), &from_addr, &from_port,
++        &from_vport);
++    if (rc < 0) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EWOULDBLOCK;
++        return -1;
++    }
++
++    u32 copied = 0;
++    const u32 total = static_cast<u32>(rc);
++    for (int i = 0; i < msg->msg_iovlen && copied < total; ++i) {
++        const auto& iov = msg->msg_iov[i];
++        const u32 chunk = std::min<u32>(static_cast<u32>(iov.iov_len), total - copied);
++        std::memcpy(iov.iov_base, received.data() + copied, chunk);
++        copied += chunk;
++    }
++
++    if (msg->msg_name != nullptr && msg->msg_namelen >= sizeof(OrbisNetSockaddrIn)) {
++        auto* orbis_from = reinterpret_cast<OrbisNetSockaddrIn*>(msg->msg_name);
++        std::memset(orbis_from, 0, sizeof(OrbisNetSockaddrIn));
++        orbis_from->sin_len = sizeof(OrbisNetSockaddrIn);
++        orbis_from->sin_family = ORBIS_NET_AF_INET;
++        orbis_from->sin_addr = from_addr;
++        orbis_from->sin_port = from_port;
++        orbis_from->sin_vport = from_vport;
++        msg->msg_namelen = sizeof(OrbisNetSockaddrIn);
++    }
++    LOG_DEBUG(Lib_Net, "P2P recvmsg: {} bytes on vport {} from {:#x}:{} (peer vport={})", copied,
++              sceNetNtohs(bound_vport_), from_addr, sceNetNtohs(from_port), sceNetNtohs(from_vport));
++    return static_cast<int>(copied);
++}
++
++int P2PSocket::GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) {
++    std::scoped_lock lock(m_mutex);
++    if (name == nullptr || namelen == nullptr || *namelen < sizeof(OrbisNetSockaddrIn)) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++    auto* orbis_name = reinterpret_cast<OrbisNetSockaddrIn*>(name);
++    std::memset(orbis_name, 0, sizeof(OrbisNetSockaddrIn));
++    orbis_name->sin_len = sizeof(OrbisNetSockaddrIn);
++    orbis_name->sin_family = ORBIS_NET_AF_INET;
++    orbis_name->sin_addr = GetP2PAdvertisedAddr();
++    orbis_name->sin_port = sceNetHtons(GetP2PConfiguredPort());
++    orbis_name->sin_vport = bound_vport_;
++    *namelen = sizeof(OrbisNetSockaddrIn);
++    return 0;
++}
++
++int P2PSocket::GetPeerName(OrbisNetSockaddr* addr, u32* namelen) {
++    std::scoped_lock lock(m_mutex);
++    if (!connected_) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_ENOTCONN;
++        return -1;
++    }
++    if (addr == nullptr || namelen == nullptr || *namelen < sizeof(OrbisNetSockaddrIn)) {
++        *Libraries::Kernel::__Error() = ORBIS_NET_EINVAL;
++        return -1;
++    }
++    auto* orbis_addr = reinterpret_cast<OrbisNetSockaddrIn*>(addr);
++    std::memset(orbis_addr, 0, sizeof(OrbisNetSockaddrIn));
++    orbis_addr->sin_len = sizeof(OrbisNetSockaddrIn);
++    orbis_addr->sin_family = ORBIS_NET_AF_INET;
++    orbis_addr->sin_addr = connected_addr_;
++    orbis_addr->sin_port = connected_port_;
++    orbis_addr->sin_vport = connected_vport_;
++    *namelen = sizeof(OrbisNetSockaddrIn);
++    return 0;
++}
++
+ } // namespace Libraries::Net
+diff --git a/src/core/libraries/network/sockets.h b/src/core/libraries/network/sockets.h
+index cbbf507..19cb5c9 100644
+--- a/src/core/libraries/network/sockets.h
++++ b/src/core/libraries/network/sockets.h
+@@ -42,6 +42,7 @@ static const GUID WSAID_WSARECVMSG = {
+ #include <unistd.h>
+ typedef int net_socket;
+ #endif
++#include <atomic>
+ #include <map>
+ #include <memory>
+ #include <mutex>
+@@ -82,6 +83,17 @@ struct Socket {
+     virtual int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) = 0;
+     virtual int fstat(Libraries::Kernel::OrbisKernelStat* stat) = 0;
+     virtual std::optional<net_socket> Native() = 0;
++    virtual bool HasQueuedData() {
++        return false;
++    }
++    // True for socket types where Native() can return the same fd for
++    // multiple distinct sockets (currently: P2PSocket, which all share one
++    // transport-wide readiness fd). sceNetEpollWait needs this to know it
++    // can't trust a single native epoll event to identify which socket(s)
++    // actually have data -- see the P2P handling there.
++    virtual bool HasSharedNativeFd() const {
++        return false;
++    }
+     std::mutex m_mutex;
+     std::mutex receive_mutex;
+     int socket_type;
+@@ -145,9 +157,25 @@ struct P2PSocket : public Socket {
+     int GetSocketAddress(OrbisNetSockaddr* name, u32* namelen) override;
+     int GetPeerName(OrbisNetSockaddr* addr, u32* namelen) override;
+     int fstat(Libraries::Kernel::OrbisKernelStat* stat) override;
+-    std::optional<net_socket> Native() override {
+-        return {};
++    std::optional<net_socket> Native() override;
++    bool HasQueuedData() override;
++    bool HasSharedNativeFd() const override {
++        return true;
+     }
++
++private:
++    // Written under m_mutex (Bind/Close) but read from ReceivePacket under the
++    // separate receive_mutex -- atomic so that's well-defined.
++    std::atomic<bool> bound_ = false;
++    std::atomic<u16> bound_vport_ = 0; // network byte order, as given by the game via sin_vport
++
++    // Set by Connect(); lets SendMessage/ReceiveMessage/GetPeerName work
++    // without the game having to pass an explicit destination each call, the
++    // same way a connected UDP socket behaves. All network byte order.
++    std::atomic<bool> connected_ = false;
++    std::atomic<u32> connected_addr_ = 0;
++    std::atomic<u16> connected_port_ = 0;
++    std::atomic<u16> connected_vport_ = 0;
+ };
+ 
+ struct UnixSocket : public Socket {
+@@ -184,6 +212,7 @@ u16 GetP2PConfiguredPort();
+ u32 GetP2PAdvertisedAddr();
+ bool EnsureP2PTransport();
+ bool P2PTransportIsReady();
++void DrainP2PReadiness();
+ int P2PSignalingSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
+ int P2PSignalingRecvFrom(void* buf, u32 len, u32* from_addr, u16* from_port);
+ int P2PControlSendTo(const void* data, u32 len, u32 dest_addr, u16 dest_port);
